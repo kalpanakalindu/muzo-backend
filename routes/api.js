@@ -544,40 +544,69 @@ router.get('/music/find', async (req, res) => {
  *       404:
  *         description: No streaming data found
  */
+// ==== In routes/api.js: REPLACE the existing router.get('/stream/:id', ...) block with this ====
+// (keep the existing `axios` and `youtubeiClient` requires at the top of the file)
+
+// JSON info about the stream (handy for debugging)
 router.get('/stream/:id', async (req, res) => {
   const { id } = req.params;
-
-  if (!id) {
-    return res.status(400).json({
-      success: false,
-      error: 'Missing required parameter: id is required'
-    });
-  }
+  if (!id) return res.status(400).json({ success: false, error: 'Missing video id' });
 
   try {
-    // Only fetch from Invidious
-    console.log(`[STREAM] Fetching for ${id} from Invidious...`);
-
-    const invidiousResult = await fetchFromInvidious(id);
-
-    if (invidiousResult) {
-      console.log('[STREAM] Invidious success, returning raw data.');
-      return res.json(invidiousResult);
-    }
-
-    // Failed
-    console.log('[STREAM] Invidious failed.');
-    res.status(404).json({
-      success: false,
-      error: 'No streaming data found from Invidious'
+    const s = await youtubeiClient.getStream(id);
+    res.json({
+      success: true,
+      id,
+      client: s.client,
+      mimeType: s.mimeType,
+      bitrate: s.bitrate,
+      durationMs: s.durationMs,
+      title: s.title,
+      author: s.author,
+      audioUrl: `/api/audio/${id}`, // proxied, works from any IP
+      directUrl: s.url              // direct googlevideo URL (may be IP-locked)
     });
   } catch (error) {
-    console.error('Stream endpoint error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-      message: error.message
+    console.error('[STREAM] failed:', error.message);
+    res.status(404).json({ success: false, error: 'No streaming data found', message: error.message });
+  }
+});
+
+// Audio proxy: pipes the audio through your server, with Range support so seeking works.
+router.get('/audio/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const s = await youtubeiClient.getStream(id);
+
+    const headers = {
+      'User-Agent':
+        s.client === 'IOS'
+          ? 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)'
+          : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+      'Range': req.headers.range || 'bytes=0-'
+    };
+
+    const upstream = await axios.get(s.url, {
+      headers,
+      responseType: 'stream',
+      timeout: 15000,
+      validateStatus: (st) => st === 200 || st === 206
     });
+
+    res.status(upstream.status);
+    res.setHeader('Content-Type', (s.mimeType || 'audio/mp4').split(';')[0]);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    for (const h of ['content-length', 'content-range']) {
+      if (upstream.headers[h]) res.setHeader(h, upstream.headers[h]);
+    }
+
+    upstream.data.pipe(res);
+    req.on('close', () => upstream.data.destroy());
+  } catch (error) {
+    console.error('[AUDIO] failed:', error.message);
+    if (!res.headersSent) res.status(502).json({ success: false, error: error.message });
   }
 });
 
