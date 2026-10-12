@@ -5,7 +5,7 @@ const { getSimilarTracks, LASTFM_API_KEY } = require('../lib/lastfm_api');
 const { getYouTubeSong } = require('../lib/get_youtube_song');
 const youtubeiClient = require('../lib/youtubei-client');
 const axios = require('axios');
-
+const { Readable } = require('stream');
 const ALLOWED_FILTERS = new Set([
   'songs',
   'videos',
@@ -544,8 +544,9 @@ router.get('/music/find', async (req, res) => {
  *       404:
  *         description: No streaming data found
  */
-// ==== In routes/api.js: REPLACE the existing router.get('/stream/:id', ...) block with this ====
-// (keep the existing `axios` and `youtubeiClient` requires at the top of the file)
+// ==== In routes/api.js: REPLACE the existing /stream/:id and /audio/:id routes with these ====
+// Also add this line near the top of routes/api.js with the other requires:
+//   const { Readable } = require('stream');
 
 // JSON info about the stream (handy for debugging)
 router.get('/stream/:id', async (req, res) => {
@@ -563,8 +564,7 @@ router.get('/stream/:id', async (req, res) => {
       durationMs: s.durationMs,
       title: s.title,
       author: s.author,
-      audioUrl: `/api/audio/${id}`, // proxied, works from any IP
-      directUrl: s.url              // direct googlevideo URL (may be IP-locked)
+      audioUrl: `/api/audio/${id}` // proxied through your backend (and your proxy)
     });
   } catch (error) {
     console.error('[STREAM] failed:', error.message);
@@ -572,26 +572,31 @@ router.get('/stream/:id', async (req, res) => {
   }
 });
 
-// Audio proxy: pipes the audio through your server, with Range support so seeking works.
+// Audio proxy: streams the audio through your server (using the same proxy IP), with Range support.
 router.get('/audio/:id', async (req, res) => {
   const { id } = req.params;
+  const abort = new AbortController();
+  // NOTE: use res (not req) 'close' - req 'close' fires right away on GET in modern Node
+  res.on('close', () => abort.abort());
+
   try {
     const s = await youtubeiClient.getStream(id);
 
-    const headers = {
-      'User-Agent':
-        s.client === 'IOS'
-          ? 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)'
-          : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-      'Range': req.headers.range || 'bytes=0-'
-    };
-
-    const upstream = await axios.get(s.url, {
-      headers,
-      responseType: 'stream',
-      timeout: 15000,
-      validateStatus: (st) => st === 200 || st === 206
+    const upstream = await fetch(s.url, {
+      headers: {
+        'User-Agent':
+          s.client === 'IOS'
+            ? 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)'
+            : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'Range': req.headers.range || 'bytes=0-'
+      },
+      dispatcher: youtubeiClient.dispatcher || undefined, // same proxy => same IP as the stream URL
+      signal: abort.signal
     });
+
+    if (upstream.status !== 200 && upstream.status !== 206) {
+      throw new Error(`Upstream responded ${upstream.status}`);
+    }
 
     res.status(upstream.status);
     res.setHeader('Content-Type', (s.mimeType || 'audio/mp4').split(';')[0]);
@@ -599,17 +604,17 @@ router.get('/audio/:id', async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('Access-Control-Allow-Origin', '*');
     for (const h of ['content-length', 'content-range']) {
-      if (upstream.headers[h]) res.setHeader(h, upstream.headers[h]);
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h, v);
     }
 
-    upstream.data.pipe(res);
-    req.on('close', () => upstream.data.destroy());
+    Readable.fromWeb(upstream.body).on('error', () => res.end()).pipe(res);
   } catch (error) {
+    if (error.name === 'AbortError') return;
     console.error('[AUDIO] failed:', error.message);
     if (!res.headersSent) res.status(502).json({ success: false, error: error.message });
   }
 });
-
 /**
  * @swagger
  * /api/search:
